@@ -36,19 +36,6 @@ adb shell getprop init.svc.adbd            # running 才算活着
 
 ⚠ `Settings.Global.ADB_ENABLED` 是诱饵：写 0 或 1 都启停不了 adbd，「开发者选项里开 USB 调试」在这台没用。
 
-### 2026-10-24 复查：这台有时 init 自己就起了 adbd
-
-恢复出厂后连测多次重启：
-
-```
-重启后 30 秒内 adb connect 被拒（Connection refused）
-但 ro.boottime.adbd = 17757538244 ns（开机 17.7 秒 adbd 就已就位）
-      cat /proc/<adbd>/status → PPid: 1
-      getprop init.svc.adbd → running
-```
-
-也就是说 **adbd 由 init 直接拉起，只是 5555 端口出现得比 `adb connect` 的首次尝试晚**。多等一会儿再连（实测最长约 44 秒）通常能连上。之前把它全归因给「必须有 app 去 toggle 属性」是过头的——那套 app（`app.adbkeep`）真正起作用的是「init 万一没点火时兜底」，而不是唯一路径。
-
 ### 通用解法：把属性 toggle 0→1
 
 制造一次变化让 init 点火，任何「触发器只认变化」的固件都适用，只需换成本机的真开关属性名：
@@ -163,7 +150,7 @@ iput-object v7, v5, Landroid/content/pm/ApplicationInfo;->packageName  # ← 改
 
 ### B. `persist.tcl.bootappmode` + `persist.SDK.boot.userapp` —— 固件自带的「开机起第三方 App」通道
 
-AMS 里 `startThirdApk(userId)` 读这两个属性，直接按 ComponentName 起应用，**完全不看 A`launcher.component`**：
+AMS 里 `startThirdApk(userId)` 读这两个属性，直接按 ComponentName 起应用，**完全不看 `launcher.component`**：
 
 ```bash
 adb shell setprop persist.tcl.bootappmode 1
@@ -263,9 +250,11 @@ Aerial 1.41 起自带滑块，来自 issue #363。反汇编确认，入口是 TC
 必须**开机桌面由固件直接拉起** + **冷启动**。`setprop ctl.restart zygote` 软重启不重走解锁流程，**复现不出来**。
 与 flavor 无关，1.31 / 1.32 都必现。
 
-尝试过的缓解（**都没能归零**，记录在此避免重复踩）：
+**早期尝试（都没归零，记录在此避免重复踩）**：
 - 用 `UserManager.isUserUnlocked` 判断：不可靠，user 状态与 CE 挂载不同步，崩溃点挪到了 `HomeViewModel`。
 - 直接 try/catch 探测 CE 存储可用性：崩溃 2 次 → 1 次。
+
+这两次「只挡一层」的失败正是下面三条修法的由来：**崩溃点会一路往后挪**（Activity → ViewModel → 无障碍服务）。
 
 **2026-10-24 已根治（自编译版验证）：** 三条崩溃点都要挡，只挡一条会挪到下一个：
 
@@ -295,7 +284,7 @@ private fun startUnlocked() { … recreate() }     // 解锁后重建整个 Acti
 
 上游 1.46 只修了 `MainActivity` 这一层；`HomeGuardService.onServiceConnected` 在解锁前仍然会跑 `refreshStockHomes()` 和 `GuardSetup.ensureAdb()`，但后者第一步就 `if (!isUserUnlocked(context)) return`，`wasHomeInFront()` 又在 `if (!isUserUnlocked) { … return }` 之后——所以第 3 层在上游不一定复现，本机是踩到了。
 
-### 2. 冷启动时 TCL 桌面偶发抢前台约 1.2 秒，随后自己崩
+### 2. 开机黑屏几秒：HOME 解析到 ResolverActivity + TCL 桌面抢前台
 
 ```
 08:42:24.8  am_create_activity: com.tcl.cyberui/.MainActivity   ← 前台被抢
@@ -312,6 +301,10 @@ cyberui 起来后以 uid 1000 去读 Settings 里的「当前桌面包」，读�
 
 **修复**：`cmd package set-home-activity --user 0 app.orchard.tv/.MainActivity`（执行后 `isDefault=true`）。
 
+⚠ **2026-10-24 复测：这条修复每次重启都失效。** 设好之后 `mMatch=0x100000`、`isDefault=true`，
+但真重启或 `ctl.restart zygote` 之后又变回 `mMatch=0x0` / `ResolverActivity`。原因见「开机直达 / `set-home-activity` 的记录为什么重启就丢」——
+三方签名 launcher 的 preferred 记录算不到匹配位，没 root 修不掉。**现在每次重启后要手动补一次**，这也是开机黑屏几秒的直接原因。
+
 **真重启复验**（2026-10-23 09:36，`adb reboot` 完整冷启动）：
 
 | 指标 | 修复前（08:42） | 修复后（09:36） |
@@ -322,7 +315,9 @@ cyberui 起来后以 uid 1000 去读 Settings 里的「当前桌面包」，读�
 | Aerial 被 force-crash | 有 | 无（只剩 CE 存储那 2 次） |
 | 前台采样 | 闪一下 TCL 再回 Aerial | 10 次连续采样全是 `app.orchard.tv/.MainActivity` |
 
-重连过程：`adb reboot` → 35 秒后 adb 恢复（uptime 26.85s）→ 前台已是 Aerial。剩余问题只有「CE 存储未解锁导致前 2 次创建崩溃」那条（见「已知问题」第 1 条），即约 2 秒黑屏。
+重连过程：`adb reboot` → 35 秒后 adb 恢复（uptime 26.85s）→ 前台已是 Aerial。
+
+这条解决的是「cyberui 抢前台」。**当时还剩的「CE 存储未解锁导致前 2 次创建崩溃」已于 2026-10-24 另行修掉**（见「已知问题」第 1 条），但即便修掉，开机到出画面之间**仍会黑一段时间**——因为 HOME 解析到 `ResolverActivity`（见「已知问题」第 2 条与「开机直达 / C」）。
 
 ### 3. 从桌面点开第三方应用，闪一下就回桌面
 
@@ -356,7 +351,8 @@ java.lang.RuntimeException: Unable to start activity ComponentInfo{com.dangbei.s
 
 ## 系统精简：28 个可停包与依赖关系
 
-2026-10-24 实测清单，全部 `pm disable-user`，可 `pm enable` 恢复。
+2026-10-24 实测清单，全部 `pm disable-user`（**只停用、不删文件**），可 `pm enable` 恢复。共 28 个：
+开机后进程数 266 → 258，前台正常，walleve/gamecenter 相关崩溃 0 条。
 
 **广告 / 商店 / 预装推荐（11）**
 
@@ -432,9 +428,11 @@ com.tcl.walleve.common.appControl.GameCenterUtil.initGameCenterId(GameCenterUtil
 | 能做 | 不能做 |
 |---|---|
 | `setprop persist.*` | `pm install`（被 compareSignatures 拦） |
-| `adb install`（streamed） | `pm disable` / `pm enable`（SecurityException） |
-| `setprop ctl.restart zygote` | 动 TCL 的 system uid 应用 |
+| `adb install`（streamed） | `pm disable` / `pm enable` **整包**禁用/启用（SecurityException）—— 用 `pm disable-user` / `pm enable` 代替，这两个实测可用 |
+| `pm disable-user` / `pm enable` | 改 `pm disable` 的组件状态（`Shell cannot change component state`） |
+| `setprop ctl.restart zygote` | |
 | `cmd package set-home-activity` | |
+| `appops set <pkg> APP_AUTO_START allow` | |
 
 ## 命令速查
 
